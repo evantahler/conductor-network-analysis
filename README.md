@@ -2,6 +2,10 @@
 
 Pcap analyzer for Little Snitch network captures. Parses packet data and prints a color-coded terminal report with service identification, connection mapping, security flags, and traffic timeline.
 
+![Little Snitch showing Conductor's network connections](images/little-snitch-conductor.png)
+
+The screenshot above shows Little Snitch's view of the Conductor app's network activity during the capture — connections to fly.dev, PostHog, Anthropic, Datadog, Arcade, GitHub (via `gh` and `ssh`), npmjs.org, incident.io, chorus.sh, conductor.build, and crabnebula.app.
+
 ## Setup
 
 ```bash
