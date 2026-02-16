@@ -77,33 +77,49 @@ def identify_ip(ip):
         return "Local"
 
     # Known IP range mappings (prefix → org)
+    # Cross-referenced with Little Snitch UI for this capture
     known = [
-        # IPv6 prefixes
-        ("2606:4700:", "Cloudflare"),
-        ("172.66.", "Cloudflare"),
-        ("104.16.", "Cloudflare"),
-        ("104.17.", "Cloudflare"),
-        ("104.18.", "Cloudflare"),
+        # Conductor app (conductor.build)
+        ("2607:6bc0:", "conductor.build"),
+        ("160.79.104.", "conductor.build"),
+
+        # Conductor backend on Fly.io (conductor-cloud-prototype.fly.dev)
+        ("2a09:8280:", "Fly.io (conductor-cloud-prototype)"),
+
+        # GitHub (git ops via gh, ssh, and HTTPS)
         ("140.82.112.", "GitHub"),
         ("140.82.113.", "GitHub"),
         ("140.82.114.", "GitHub"),
         ("140.82.116.", "GitHub"),
         ("140.82.118.", "GitHub"),
         ("140.82.121.", "GitHub"),
-        ("20.200.", "GitHub/Microsoft"),
+        ("20.200.", "GitHub"),
         ("2606:50c0:", "GitHub"),
-        ("2600:1901:", "Google Cloud"),
-        ("2600:1f18:", "AWS"),
+
+        # Cloudflare-fronted services (arcade.dev, posthog, incident.io, chorus.sh, etc.)
+        ("2606:4700:", "Cloudflare CDN"),
+        ("172.66.", "Cloudflare CDN"),
+        ("104.16.", "Cloudflare CDN"),
+        ("104.17.", "Cloudflare CDN"),
+        ("104.18.", "Cloudflare CDN"),
+
+        # Anthropic API (hosted on GCP)
+        ("2600:1901:", "GCP (likely api.anthropic.com)"),
+        ("34.149.", "GCP (likely api.anthropic.com)"),
+
+        # Datadog / PostHog (AWS-hosted)
+        ("2600:1f18:", "AWS (likely datadoghq.com)"),
         ("2600:1f1c:", "AWS"),
-        ("2607:6bc0:", "Conductor (Linear)"),
-        ("160.79.104.", "Conductor (Linear)"),
-        ("2a09:8280:", "Fly.io"),
+
+        # Vercel
         ("76.76.21.", "Vercel"),
         ("76.223.", "Vercel"),
+
+        # Other
         ("2a00:1450:", "Google"),
         ("142.250.", "Google"),
         ("2620:1ec:", "Akamai"),
-        ("66.33.60.", "Linear/Render"),
+        ("66.33.60.", "crabnebula.app"),
     ]
 
     for prefix, org in known:
