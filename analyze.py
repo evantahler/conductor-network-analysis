@@ -64,10 +64,20 @@ def ip_str(packed):
     return packed.hex()
 
 
-def identify_ip(ip):
-    """Identify an IP by known ranges, rDNS, or ASN hints."""
+def identify_ip(ip, ip_to_sni=None):
+    """Identify an IP by SNI (preferred), known ranges, rDNS, or ASN hints.
+
+    When ip_to_sni is provided, SNI takes priority over IP-range heuristics.
+    """
     if not hasattr(identify_ip, "_cache"):
         identify_ip._cache = {}
+
+    # SNI always wins — check it first (not cached, since the map may change)
+    if ip_to_sni and ip in ip_to_sni:
+        result = ip_to_sni[ip]
+        identify_ip._cache[ip] = result
+        return result
+
     if ip in identify_ip._cache:
         return identify_ip._cache[ip]
 
@@ -76,13 +86,8 @@ def identify_ip(ip):
         identify_ip._cache[ip] = "Local"
         return "Local"
 
-    # Known IP range mappings (prefix → org)
-    # Cross-referenced with Little Snitch UI for this capture
+    # Known IP range mappings (prefix → org) — fallback when no SNI observed
     known = [
-        # Conductor app (conductor.build)
-        ("2607:6bc0:", "conductor.build"),
-        ("160.79.104.", "conductor.build"),
-
         # Conductor backend on Fly.io (conductor-cloud-prototype.fly.dev)
         ("2a09:8280:", "Fly.io (conductor-cloud-prototype)"),
 
@@ -96,7 +101,7 @@ def identify_ip(ip):
         ("20.200.", "GitHub"),
         ("2606:50c0:", "GitHub"),
 
-        # Cloudflare-fronted services (arcade.dev, posthog, incident.io, chorus.sh, etc.)
+        # Cloudflare-fronted services
         ("2606:4700:", "Cloudflare CDN"),
         ("172.66.", "Cloudflare CDN"),
         ("104.16.", "Cloudflare CDN"),
@@ -107,8 +112,8 @@ def identify_ip(ip):
         ("2600:1901:", "GCP (likely api.anthropic.com)"),
         ("34.149.", "GCP (likely api.anthropic.com)"),
 
-        # Datadog / PostHog (AWS-hosted)
-        ("2600:1f18:", "AWS (likely datadoghq.com)"),
+        # AWS
+        ("2600:1f18:", "AWS"),
         ("2600:1f1c:", "AWS"),
 
         # Vercel
@@ -187,6 +192,71 @@ def section(title):
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
 
+def _parse_tls_client_hello(data):
+    """Extract SNI and ALPN from a TLS ClientHello message.
+
+    Returns (sni, alpn) where either may be None.
+    """
+    sni = None
+    alpn = None
+    try:
+        if len(data) < 5 or data[0] != 0x16:  # TLS handshake
+            return None, None
+        pos = 5
+        if data[pos] != 0x01:  # ClientHello
+            return None, None
+        pos += 4  # handshake header
+        pos += 2  # client version
+        pos += 32  # random
+        sid_len = data[pos]
+        pos += 1 + sid_len
+        cs_len = struct.unpack("!H", data[pos : pos + 2])[0]
+        pos += 2 + cs_len
+        comp_len = data[pos]
+        pos += 1 + comp_len
+        ext_len = struct.unpack("!H", data[pos : pos + 2])[0]
+        pos += 2
+        end = pos + ext_len
+        while pos < end:
+            ext_type = struct.unpack("!H", data[pos : pos + 2])[0]
+            ext_data_len = struct.unpack("!H", data[pos + 2 : pos + 4])[0]
+            pos += 4
+            if ext_type == 0x0000:  # SNI
+                name_len = struct.unpack("!H", data[pos + 3 : pos + 5])[0]
+                sni = data[pos + 5 : pos + 5 + name_len].decode("ascii", errors="replace")
+            elif ext_type == 0x0010:  # ALPN
+                # ALPN extension: list_len (2) then repeated: str_len (1) + string
+                alpn_list_len = struct.unpack("!H", data[pos : pos + 2])[0]
+                alpn_pos = pos + 2
+                alpn_end = pos + alpn_list_len + 2
+                protocols = []
+                while alpn_pos < alpn_end and alpn_pos < pos + ext_data_len:
+                    proto_len = data[alpn_pos]
+                    alpn_pos += 1
+                    protocols.append(data[alpn_pos : alpn_pos + proto_len].decode("ascii", errors="replace"))
+                    alpn_pos += proto_len
+                if protocols:
+                    alpn = protocols[0]  # Use first (preferred) protocol
+            pos += ext_data_len
+    except (IndexError, struct.error):
+        pass
+    return sni, alpn
+
+
+def _parse_ssh_banner(data):
+    """Extract SSH version string from first payload on port 22."""
+    try:
+        if data[:4] == b"SSH-":
+            # SSH banner is a single line ending in \r\n
+            end = data.find(b"\r\n")
+            if end == -1:
+                end = min(len(data), 255)
+            return data[:end].decode("ascii", errors="replace")
+    except (IndexError, UnicodeDecodeError):
+        pass
+    return None
+
+
 def parse_pcap(path):
     """Parse pcap file and return structured data."""
     packets = []
@@ -197,6 +267,19 @@ def parse_pcap(path):
     proto_stats = defaultdict(lambda: {"packets": 0, "bytes": 0})
     ip_src_bytes = Counter()
     ip_dst_bytes = Counter()
+
+    # New: SNI/ALPN/SSH tracking
+    ip_to_sni = {}  # remote IP -> SNI hostname
+    ip_to_alpn = {}  # remote IP -> ALPN protocol string
+    ip_to_ssh_banner = {}  # remote IP -> SSH version string
+    # Per-destination directional byte tracking (payload bytes only)
+    dest_out_bytes = Counter()  # remote IP -> outbound payload bytes
+    dest_in_bytes = Counter()  # remote IP -> inbound payload bytes
+    dest_out_pkts = Counter()
+    dest_in_pkts = Counter()
+    dest_ports = {}  # remote IP -> set of destination ports
+    dest_first_ts = {}  # remote IP -> first packet timestamp
+    dest_last_ts = {}  # remote IP -> last packet timestamp
 
     with open(path, "rb") as f:
         try:
@@ -263,6 +346,52 @@ def parse_pcap(path):
                     # Check for DNS over TCP or HTTP
                     if dport == 53 or sport == 53:
                         _try_parse_dns(tcp.data, dns_queries, dns_responses, ip_to_hostnames, ts)
+
+                    # ── SNI / ALPN / SSH extraction ──
+                    payload = bytes(tcp.data)
+                    if payload:
+                        src_local = _is_local(src)
+                        dst_local = _is_local(dst)
+
+                        if src_local and not dst_local:
+                            # Outbound packet
+                            remote_ip = dst
+                            dest_out_bytes[remote_ip] += len(payload)
+                            dest_out_pkts[remote_ip] += 1
+                            dest_ports.setdefault(remote_ip, set()).add(dport)
+                            if remote_ip not in dest_first_ts:
+                                dest_first_ts[remote_ip] = ts
+                            dest_last_ts[remote_ip] = ts
+
+                            # TLS ClientHello (SNI + ALPN)
+                            if remote_ip not in ip_to_sni:
+                                sni, alpn = _parse_tls_client_hello(payload)
+                                if sni:
+                                    ip_to_sni[remote_ip] = sni
+                                if alpn:
+                                    ip_to_alpn[remote_ip] = alpn
+
+                            # SSH banner on port 22
+                            if dport == 22 and remote_ip not in ip_to_ssh_banner:
+                                banner = _parse_ssh_banner(payload)
+                                if banner:
+                                    ip_to_ssh_banner[remote_ip] = banner
+
+                        elif dst_local and not src_local:
+                            # Inbound packet
+                            remote_ip = src
+                            dest_in_bytes[remote_ip] += len(payload)
+                            dest_in_pkts[remote_ip] += 1
+                            dest_ports.setdefault(remote_ip, set()).add(sport)
+                            if remote_ip not in dest_first_ts:
+                                dest_first_ts[remote_ip] = ts
+                            dest_last_ts[remote_ip] = ts
+
+                            # Server might also send SSH banner
+                            if sport == 22 and remote_ip not in ip_to_ssh_banner:
+                                banner = _parse_ssh_banner(payload)
+                                if banner:
+                                    ip_to_ssh_banner[remote_ip] = banner
                 else:
                     sport = dport = 0
                     flow_key = (src, 0, dst, 0, "TCP")
@@ -310,6 +439,16 @@ def parse_pcap(path):
         "dns_responses": dns_responses,
         "ip_to_hostnames": ip_to_hostnames,
         "flows": flows,
+        "ip_to_sni": ip_to_sni,
+        "ip_to_alpn": ip_to_alpn,
+        "ip_to_ssh_banner": ip_to_ssh_banner,
+        "dest_out_bytes": dest_out_bytes,
+        "dest_in_bytes": dest_in_bytes,
+        "dest_out_pkts": dest_out_pkts,
+        "dest_in_pkts": dest_in_pkts,
+        "dest_ports": dest_ports,
+        "dest_first_ts": dest_first_ts,
+        "dest_last_ts": dest_last_ts,
     }
 
 
@@ -415,14 +554,17 @@ def print_top_talkers(data):
             all_ips[ip] += b
 
     hostnames = data["ip_to_hostnames"]
+    sni_map = data.get("ip_to_sni", {})
 
     print(f"  {bold('By total bytes (src + dst):')}\n")
     rows = []
     for ip, total in all_ips.most_common(15):
         sent = data["ip_src_bytes"].get(ip, 0)
         recv = data["ip_dst_bytes"].get(ip, 0)
+        # Prefer SNI, then DNS, then IP-range heuristic
+        sni = sni_map.get(ip)
         names = hostnames.get(ip, set())
-        display_name = ", ".join(sorted(names)[:2]) if names else (identify_ip(ip) or dim("—"))
+        display_name = sni or (", ".join(sorted(names)[:2]) if names else None) or identify_ip(ip, sni_map) or dim("—")
         rows.append([ip, fmt_bytes(sent), fmt_bytes(recv), fmt_bytes(total), display_name])
 
     print(ascii_table(
@@ -435,6 +577,7 @@ def print_top_talkers(data):
 def print_service_breakdown(data):
     section("4. Service Breakdown")
     flows = data["flows"]
+    sni_map = data.get("ip_to_sni", {})
 
     # Aggregate bytes by identified service
     service_bytes = Counter()
@@ -442,7 +585,7 @@ def print_service_breakdown(data):
     for (src, sport, dst, dport, proto), info in flows.items():
         # Identify remote endpoint
         remote = dst if _is_local(src) or (not _is_local(dst)) else src
-        svc = identify_ip(remote) or "Unknown"
+        svc = identify_ip(remote, sni_map) or "Unknown"
         if svc == "Local":
             continue
         service_bytes[svc] += info["bytes"]
@@ -461,8 +604,136 @@ def print_service_breakdown(data):
     ))
 
 
+def _classify_traffic(out_bytes, in_bytes, ports, sni, ssh_banner):
+    """Classify traffic type based on flow patterns.
+
+    Returns (traffic_type, detail).
+    """
+    total = out_bytes + in_bytes
+    if total == 0:
+        return "Unknown", ""
+
+    out_ratio = out_bytes / total if total else 0
+
+    # SSH on port 22
+    if 22 in ports:
+        if out_bytes > in_bytes and out_bytes > 10000:
+            return "Git push", "Outbound commit data via SSH"
+        elif in_bytes > out_bytes and in_bytes > 10000:
+            return "Git pull/fetch", "Inbound objects via SSH"
+        else:
+            return "Git SSH", "SSH session (commands/auth)"
+
+    # npm registry
+    if sni and "npmjs" in sni:
+        return "Package registry", "npm registry queries"
+
+    # Known analytics / telemetry
+    if sni and any(t in sni for t in ("posthog", "datadog", "datadoghq", "sentry")):
+        return "Telemetry", "Event/metric telemetry"
+
+    # Known update / CDN
+    if sni and any(t in sni for t in ("crabnebula", "releases", "update")):
+        return "App update", "Update check / binary download"
+
+    # LLM API pattern: large outbound (prompts/context) with responses back
+    if sni and "anthropic" in sni:
+        if out_bytes > 50000:
+            return "LLM API calls", "Prompts + code context → completions"
+        return "LLM API calls", "API requests to Anthropic"
+
+    # Large outbound bursts with small inbound = API request-heavy
+    if out_bytes > 50000 and out_ratio > 0.7:
+        return "API calls (upload)", "Large outbound payloads"
+
+    # Small outbound, large inbound = data download / API responses
+    if in_bytes > 10000 and out_ratio < 0.3:
+        return "API calls (download)", "Receiving data / responses"
+
+    # Bidirectional moderate traffic
+    if out_bytes > 2000 and in_bytes > 2000:
+        return "REST API", "Bidirectional API traffic"
+
+    # Small single exchanges
+    if total < 5000:
+        return "Status check", "Health ping / keep-alive"
+
+    return "Web traffic", "HTTPS session"
+
+
+def print_outbound_data_analysis(data):
+    section("5. Outbound Data Analysis")
+
+    sni_map = data.get("ip_to_sni", {})
+    alpn_map = data.get("ip_to_alpn", {})
+    ssh_map = data.get("ip_to_ssh_banner", {})
+    dest_out = data.get("dest_out_bytes", {})
+    dest_in = data.get("dest_in_bytes", {})
+    dest_ports = data.get("dest_ports", {})
+
+    # Gather all remote IPs that had any traffic
+    all_remotes = set(dest_out.keys()) | set(dest_in.keys())
+
+    # Group by SNI hostname (or IP if no SNI)
+    host_stats = defaultdict(lambda: {"out": 0, "in": 0, "ips": set(), "ports": set()})
+    for remote_ip in all_remotes:
+        hostname = sni_map.get(remote_ip)
+        if not hostname:
+            # For SSH, use "host:22" style
+            ports = dest_ports.get(remote_ip, set())
+            if 22 in ports:
+                ident = identify_ip(remote_ip, sni_map) or remote_ip
+                hostname = f"{ident}:22"
+            else:
+                hostname = identify_ip(remote_ip, sni_map) or remote_ip
+
+        host_stats[hostname]["out"] += dest_out.get(remote_ip, 0)
+        host_stats[hostname]["in"] += dest_in.get(remote_ip, 0)
+        host_stats[hostname]["ips"].add(remote_ip)
+        host_stats[hostname]["ports"].update(dest_ports.get(remote_ip, set()))
+
+    # Sort by total bytes descending
+    sorted_hosts = sorted(host_stats.items(), key=lambda x: x[1]["out"] + x[1]["in"], reverse=True)
+
+    rows = []
+    for hostname, stats in sorted_hosts:
+        out_b = stats["out"]
+        in_b = stats["in"]
+        ports = stats["ports"]
+
+        # Determine protocol string
+        sample_ip = next(iter(stats["ips"]))
+        alpn = alpn_map.get(sample_ip)
+        ssh_banner = ssh_map.get(sample_ip)
+        if ssh_banner:
+            proto_str = "SSH"
+        elif alpn:
+            proto_str = f"{alpn}/TLS"
+        elif 443 in ports:
+            proto_str = "TLS"
+        else:
+            proto_str = "TCP"
+
+        traffic_type, detail = _classify_traffic(out_b, in_b, ports, hostname, ssh_banner)
+
+        rows.append([
+            bold(hostname),
+            proto_str,
+            fmt_bytes(out_b),
+            fmt_bytes(in_b),
+            traffic_type,
+            dim(detail),
+        ])
+
+    print(ascii_table(
+        ["Destination", "Protocol", "Out Bytes", "In Bytes", "Type", "Detail"],
+        rows,
+        col_align=["l", "l", "r", "r", "l", "l"],
+    ))
+
+
 def print_dns_analysis(data):
-    section("5. DNS Analysis")
+    section("6. DNS Analysis")
     queries = data["dns_queries"]
     responses = data["dns_responses"]
 
@@ -487,18 +758,22 @@ def print_dns_analysis(data):
 
 
 def print_connection_map(data):
-    section("6. Connection Map (Top 30 Flows)")
+    section("7. Connection Map (Top 30 Flows)")
     flows = data["flows"]
     hostnames = data["ip_to_hostnames"]
+    sni_map = data.get("ip_to_sni", {})
 
     sorted_flows = sorted(flows.items(), key=lambda x: x[1]["bytes"], reverse=True)[:30]
 
     rows = []
     for (src, sport, dst, dport, proto), info in sorted_flows:
+        dst_sni = sni_map.get(dst)
+        src_sni = sni_map.get(src)
         dst_names = hostnames.get(dst, set())
         src_names = hostnames.get(src, set())
-        host = (", ".join(sorted(dst_names)[:1]) or ", ".join(sorted(src_names)[:1])
-                or identify_ip(dst) or identify_ip(src) or "")
+        host = (dst_sni or src_sni
+                or ", ".join(sorted(dst_names)[:1]) or ", ".join(sorted(src_names)[:1])
+                or identify_ip(dst, sni_map) or identify_ip(src, sni_map) or "")
 
         flags = ",".join(sorted(info["flags"])) if info["flags"] else ""
 
@@ -530,9 +805,10 @@ def _is_local(ip):
 
 
 def print_security_flags(data):
-    section("7. Security Flags")
+    section("8. Security Flags")
     flows = data["flows"]
     hostnames = data["ip_to_hostnames"]
+    sni_map = data.get("ip_to_sni", {})
     findings = []
 
     well_known_ports = {80, 443, 53, 22, 993, 995, 587, 465, 123, 5353, 5228, 5229, 5230}
@@ -540,19 +816,19 @@ def print_security_flags(data):
     for (src, sport, dst, dport, proto), info in flows.items():
         # Plaintext HTTP to remote servers
         if dport == 80 and proto == "TCP" and info["bytes"] > 0 and not _is_local(dst):
-            host = identify_ip(dst) or dst
+            host = identify_ip(dst, sni_map) or dst
             findings.append((red("PLAINTEXT HTTP"), f"→ {host}:{dport}", fmt_bytes(info["bytes"])))
 
         # Non-standard destination ports (only flag actual server ports, not ephemeral client ports)
         if (proto == "TCP" and dport not in well_known_ports and dport > 0
                 and dport < 1024 and info["bytes"] > 5000 and not _is_local(dst)):
-            host = identify_ip(dst) or dst
+            host = identify_ip(dst, sni_map) or dst
             findings.append((yellow("NON-STD PORT"), f"→ {host}:{dport}", fmt_bytes(info["bytes"])))
 
         # RST flags (connection resets)
         if "RST" in info.get("flags", set()) and info["packets"] > 5:
             remote = dst if not _is_local(dst) else src
-            host = identify_ip(remote) or remote
+            host = identify_ip(remote, sni_map) or remote
             findings.append((yellow("CONN RESETS"), f"↔ {host} ({info['packets']} pkts)", ""))
 
     if not findings:
@@ -577,7 +853,7 @@ def print_security_flags(data):
 
 
 def print_timeline(data):
-    section("8. Traffic Timeline")
+    section("9. Traffic Timeline")
     pkts = data["packets"]
     if not pkts:
         return
@@ -642,6 +918,7 @@ def main():
     print_protocol_breakdown(data)
     print_top_talkers(data)
     print_service_breakdown(data)
+    print_outbound_data_analysis(data)
     print_dns_analysis(data)
     print_connection_map(data)
     print_security_flags(data)
